@@ -41,6 +41,8 @@ require_once PF_PLUGIN_PATH . 'includes/class-pf-importer.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-pricing.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-gateway.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-frontend.php';
+require_once PF_PLUGIN_PATH . 'includes/class-pf-webhook.php';
+require_once PF_PLUGIN_PATH . 'includes/class-pf-product-creator.php';
 
 // 3. Inizializzazione Plugin
 function pf_init_plugin() {
@@ -48,6 +50,8 @@ function pf_init_plugin() {
     new PF_Pricing();
     new PF_Gateway();
     new PF_Frontend();
+    new PF_Webhook();
+    new PF_Product_Creator();
     // Settings si auto-inizializza se is_admin()
 }
 add_action( 'plugins_loaded', 'pf_init_plugin' );
@@ -131,4 +135,140 @@ function pf_handle_ajax_calculation() {
         'unit_html' => wc_price( $total_unit_price ),
         'breakdown_html' => implode('<br>', $breakdown)
     ]);
+}
+
+
+
+// --- AREA TEST: DA RIMUOVERE IN PRODUZIONE ---
+
+add_action( 'init', 'pf_inject_test_data' );
+
+function pf_inject_test_data() {
+    // Esegui solo se c'è il parametro nell'URL
+    if ( ! isset( $_GET['setup_test_data'] ) ) return;
+
+    // 1. Trova il prodotto Agenda tramite SKU
+    $sku_da_cercare = '10624601'; 
+    $product_id = wc_get_product_id_by_sku( $sku_da_cercare );
+
+    if ( ! $product_id ) {
+        wp_die( "Errore: Nessun prodotto trovato con SKU $sku_da_cercare. Controlla di averlo inserito correttamente in WooCommerce." );
+    }
+
+    // A. LISTINO PREZZI ARTICOLO (Tiered Pricing)
+    $fake_scales = [
+        1    => 5.50,  // Base
+        30   => 5.00,  // Sconto 1
+        100  => 4.50,  // Sconto 2
+        500  => 4.00,  // Sconto 3
+    ];
+    update_post_meta( $product_id, '_pf_price_scales', $fake_scales );
+    update_post_meta( $product_id, '_pf_net_price', 5.50 );
+
+    // B. REGOLE DI STAMPA (Fondamentale per il nuovo Frontend!)
+    // Questo dice al sito: "Su questo prodotto puoi fare Serigrafia sul Fronte o sul Retro"
+    $fake_print_options = [
+        'GPE02' => [
+            'name' => 'Serigrafia (Test)',
+            'locations' => [
+                [ 'name' => 'Fronte Copertina', 'config_id' => '6-front' ],
+                [ 'name' => 'Retro Copertina', 'config_id' => '6-back' ]
+            ]
+        ],
+        'LAS02' => [
+            'name' => 'Incisione Laser',
+            'locations' => [
+                [ 'name' => 'Su targhetta metallica', 'config_id' => '7-plate' ]
+            ]
+        ]
+    ];
+    update_post_meta( $product_id, '_pf_print_options', $fake_print_options );
+
+    // C. PREZZI DI STAMPA (Nel Database Custom)
+    global $wpdb;
+    $table_print = $wpdb->prefix . 'pf_print_prices';
+    
+    // Svuota tabella per pulizia
+    $wpdb->query("TRUNCATE TABLE $table_print");
+
+    // Inseriamo prezzi per SERIGRAFIA (GPE02)
+    // 1 Colore
+    $wpdb->insert($table_print, ['print_code' => 'GPE02', 'quantity_start' => 1,   'colors_count' => 1, 'unit_price' => 0.60, 'setup_cost' => 45.00]);
+    $wpdb->insert($table_print, ['print_code' => 'GPE02', 'quantity_start' => 50,  'colors_count' => 1, 'unit_price' => 0.50, 'setup_cost' => 45.00]);
+    $wpdb->insert($table_print, ['print_code' => 'GPE02', 'quantity_start' => 100, 'colors_count' => 1, 'unit_price' => 0.40, 'setup_cost' => 45.00]);
+    
+    // 2 Colori (più costoso)
+    $wpdb->insert($table_print, ['print_code' => 'GPE02', 'quantity_start' => 1,   'colors_count' => 2, 'unit_price' => 0.90, 'setup_cost' => 90.00]);
+    
+    // Inseriamo prezzi per LASER (LAS02)
+    $wpdb->insert($table_print, ['print_code' => 'LAS02', 'quantity_start' => 1,   'colors_count' => 1, 'unit_price' => 0.80, 'setup_cost' => 50.00]);
+
+    // Conferma a video
+    wp_die( "✅ DATI TEST INSERITI!<br>Prodotto ID: $product_id ($sku_da_cercare)<br>- Prezzi a scalare inseriti<br>- Opzioni Stampa (Serigrafia/Laser) inserite<br>- Costi stampa inseriti nel DB.<br><br><b>Ora vai sulla pagina prodotto e ricarica (F5).</b>" );
+}
+
+// Gestore AJAX Bulk Add to Cart
+add_action( 'wp_ajax_pf_bulk_add_to_cart', 'pf_handle_bulk_add_cart' );
+add_action( 'wp_ajax_nopriv_pf_bulk_add_to_cart', 'pf_handle_bulk_add_cart' );
+
+function pf_handle_bulk_add_cart() {
+    check_ajax_referer( 'pf_calc_nonce', 'security' );
+    
+    // Decodifica items dal JSON inviato via FormData
+    $items = isset($_POST['items_json']) ? json_decode(stripslashes($_POST['items_json']), true) : [];
+    $print_data = $_POST['print_data'] ?? [];
+    
+    if ( empty( $items ) || ! is_array( $items ) ) {
+        wp_send_json_error( 'Nessun articolo selezionato' );
+    }
+
+    // GESTIONE UPLOAD FILE
+    $file_url = '';
+    if ( ! empty( $_FILES['pf_logo_file'] ) ) {
+        $uploaded = $_FILES['pf_logo_file'];
+        
+        // Controlli sicurezza base
+        $allowed = ['pdf','ai','eps','png','jpg','jpeg'];
+        $ext = pathinfo($uploaded['name'], PATHINFO_EXTENSION);
+        if(!in_array(strtolower($ext), $allowed)) {
+            wp_send_json_error('Formato file non valido. Usa PDF, AI, o PNG.');
+        }
+
+        // Usa le funzioni WP per l'upload sicuro
+        require_once( ABSPATH . 'wp-admin/includes/file.php' );
+        $upload_overrides = [ 'test_form' => false ];
+        $movefile = wp_handle_upload( $uploaded, $upload_overrides );
+
+        if ( $movefile && ! isset( $movefile['error'] ) ) {
+            $file_url = $movefile['url']; // URL pubblico del file
+        } else {
+            wp_send_json_error( 'Errore caricamento file: ' . $movefile['error'] );
+        }
+    }
+
+    // AGGIUNTA AL CARRELLO
+    foreach ( $items as $item ) {
+        $var_id = intval( $item['variation_id'] );
+        $qty = intval( $item['quantity'] );
+        $product = wc_get_product( $var_id );
+        
+        if ( ! $product ) continue;
+        
+        // Prepara i meta custom
+        $cart_item_data = [];
+        if ( ! empty( $print_data['code'] ) ) {
+            $cart_item_data['pf_customization'] = [
+                'print_code' => sanitize_text_field( $print_data['code'] ),
+                'config_id'  => sanitize_text_field( $print_data['config_id'] ),
+                'colors'     => intval( $print_data['colors'] ),
+                'file_url'   => $file_url // Salviamo l'URL del file caricato
+            ];
+            // Unique key per evitare raggruppamenti indesiderati
+            $cart_item_data['unique_key'] = md5( microtime() . rand() );
+        }
+
+        WC()->cart->add_to_cart( $product->get_parent_id(), $qty, $var_id, [], $cart_item_data );
+    }
+
+    wp_send_json_success();
 }

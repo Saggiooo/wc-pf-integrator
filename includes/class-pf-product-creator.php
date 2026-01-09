@@ -56,73 +56,307 @@ class PF_Product_Creator {
         <?php
     }
 
-    public function ajax_create_product() {
-        set_time_limit(900); 
-        ini_set('memory_limit', '4096M'); 
+    /**
+ * Scarica un JSON grande in un file temporaneo e lo decodifica.
+ * Ritorna array se ok, stringa errore se fail.
+ */
+private function fetch_json_stream_temp( $url ) {
 
-        $target_sku = trim( sanitize_text_field( $_POST['sku'] ) );
-        if( empty($target_sku) ) wp_send_json_error("SKU mancante.");
+    // download_url usa WP HTTP API e scrive un tmp file
+    $tmp_file = download_url( $url, 120 ); // 120s timeout
 
-        // 1. Lettura File
-        $json_file_path = PF_PLUGIN_PATH . 'prodottipf.json';
-        if ( ! file_exists( $json_file_path ) ) wp_send_json_error( "File prodottipf.json non trovato." );
+    if ( is_wp_error( $tmp_file ) ) {
+        return "Errore download: " . $tmp_file->get_error_message();
+    }
 
-        $json_content = file_get_contents( $json_file_path );
-        $data = json_decode( $json_content, true );
-        
-        if ( empty( $data ) ) wp_send_json_error( "Errore lettura JSON." );
+    $json_content = file_get_contents( $tmp_file );
+    @unlink( $tmp_file );
 
-        // 2. Navigazione
-        $models_list = [];
-        if ( isset($data['pfcProductfeed']['productfeed']['models']) ) {
-            $models_list = $data['pfcProductfeed']['productfeed']['models'];
-        } elseif ( isset($data['products']['models']['model']) ) {
-            $models_list = $data['products']['models']['model'];
-        } elseif ( isset($data['models']['model']) ) {
-            $models_list = $data['models']['model'];
-        } elseif ( isset($data['model']) ) {
-            $models_list = $data['model'];
+    if ( empty( $json_content ) ) {
+        return "File scaricato ma vuoto.";
+    }
+
+    // Rimuove BOM
+    $json_content = trim( $json_content, "\xEF\xBB\xBF" );
+
+    $data = json_decode( $json_content, true );
+
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+        // fallback encoding (PF a volte fa scherzi)
+        if ( function_exists('mb_convert_encoding') ) {
+            $json_content = mb_convert_encoding($json_content, 'UTF-8', 'ISO-8859-1');
+            $data = json_decode( $json_content, true );
         }
 
-        if ( empty($models_list) ) wp_send_json_error( "Struttura JSON non riconosciuta." );
+        if ( json_last_error() !== JSON_ERROR_NONE ) {
+            return "Errore JSON: " . json_last_error_msg();
+        }
+    }
 
-        // 3. Cerca modello
-        $found_model = null;
-        foreach ( $models_list as $item ) {
-            $candidate = (isset($item['model']) && is_array($item['model'])) ? $item['model'] : $item;
-            if ( isset( $candidate['modelCode'] ) ) {
-                if ( strcasecmp( trim($candidate['modelCode']), $target_sku ) === 0 ) {
-                    $found_model = $candidate;
-                    break;
+    return $data;
+}
+
+private function fetch_json_stream($url) {
+    $tmp_file = download_url( $url );
+
+    if ( is_wp_error( $tmp_file ) ) {
+        return "Errore download: " . $tmp_file->get_error_message();
+    }
+
+    $json_content = file_get_contents( $tmp_file );
+    @unlink( $tmp_file );
+
+    if ( empty( $json_content ) ) return "File scaricato ma vuoto.";
+
+    $json_content = trim( $json_content, "\xEF\xBB\xBF" );
+
+    $data = json_decode( $json_content, true );
+
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+        $json_content = mb_convert_encoding($json_content, 'UTF-8', 'ISO-8859-1');
+        $data = json_decode( $json_content, true );
+
+        if ( json_last_error() !== JSON_ERROR_NONE ) {
+            return "Errore JSON Syntax: " . json_last_error_msg();
+        }
+    }
+
+    return $data;
+}
+
+
+/**
+ * Estrae la lista modelli dal productfeed PF in modo ultra-robusto.
+ * Ritorna array di modelli (ognuno con modelCode), oppure [] se non trova nulla.
+ */
+private function extract_models_list_from_productfeed( $data ) {
+
+    // 1) PATH NOTI (casing/nomi che PF usa spesso)
+    $paths = [
+        ['PFCProductfeed','productfeed','models','model'],
+        ['PFCProductFeed','productfeed','models','model'],
+        ['pfcProductfeed','productfeed','models','model'],
+        ['pfcProductFeed','productfeed','models','model'],
+
+        // a volte cambia productfeed/ProductFeed
+        ['PFCProductfeed','Productfeed','models','model'],
+        ['PFCProductFeed','Productfeed','models','model'],
+        ['pfcProductfeed','Productfeed','models','model'],
+        ['pfcProductFeed','Productfeed','models','model'],
+
+        // alcuni feed hanno products->models->model
+        ['products','models','model'],
+        ['models','model'],
+        ['model'],
+    ];
+
+    foreach ( $paths as $path ) {
+        $node = $data;
+        $ok = true;
+        foreach ( $path as $k ) {
+            if ( is_array($node) && array_key_exists($k, $node) ) {
+                $node = $node[$k];
+            } else {
+                $ok = false;
+                break;
+            }
+        }
+        if ( ! $ok || empty($node) ) continue;
+
+        // Normalizza wrapper PF: models può essere [ {count, model:[...]} ]
+        $list = $this->normalize_model_list_node( $node );
+        if ( ! empty($list) ) return $list;
+    }
+
+    // 2) FALLBACK: scan iterativo (no ricorsione profonda che ti spacca lo stack)
+    // Cerchiamo un nodo chiave "model" che sia lista e contenga modelCode.
+    $stack = [ $data ];
+    $max_visits = 200000; // safety
+    $visits = 0;
+
+    while ( ! empty($stack) ) {
+        $visits++;
+        if ( $visits > $max_visits ) break;
+
+        $node = array_pop($stack);
+        if ( ! is_array($node) ) continue;
+
+        foreach ( $node as $key => $value ) {
+            if ( $key === 'model' && is_array($value) ) {
+                $list = $this->normalize_model_list_node( $value );
+                if ( ! empty($list) ) return $list;
+            }
+
+            if ( is_array($value) ) {
+                $stack[] = $value;
+            }
+        }
+    }
+
+    return [];
+}
+
+/**
+ * Normalizza vari casi:
+ * - value già = [ {modelCode:...}, ... ]
+ * - value = {modelCode:...} singolo
+ * - value = [ {count:..., model:[...] } ] wrapper
+ * - value = {count:..., model:[...] } wrapper
+ */
+private function normalize_model_list_node( $node ) {
+
+    if ( empty($node) || !is_array($node) ) return [];
+
+    // Caso: wrapper singolo {count, model:[...]}
+    if ( isset($node['model']) && is_array($node['model']) ) {
+        $node = $node['model'];
+    }
+
+    // Caso: wrapper array [ {count, model:[...]} ]
+    if ( isset($node[0]) && is_array($node[0]) && isset($node[0]['model']) && is_array($node[0]['model']) ) {
+        $node = $node[0]['model'];
+    }
+
+    // Normalizza singolo modello in array
+    if ( is_array($node) && !isset($node[0]) ) {
+        // se è proprio un modello con modelCode
+        if ( isset($node['modelCode']) ) {
+            $node = [ $node ];
+        }
+    }
+
+    if ( empty($node) || !is_array($node) ) return [];
+
+    // Valida: deve contenere modelCode (diretto o sotto ['model'])
+    $first = $node[0] ?? null;
+    if ( !is_array($first) ) return [];
+
+    if ( isset($first['modelCode']) ) return $node;
+
+    // a volte ogni elemento è { model: {...} }
+    if ( isset($first['model']) && is_array($first['model']) && isset($first['model']['modelCode']) ) {
+        $out = [];
+        foreach ( $node as $wrap ) {
+            if ( isset($wrap['model']) && is_array($wrap['model']) ) {
+                $out[] = $wrap['model'];
+            }
+        }
+        return $out;
+    }
+
+    return [];
+}
+
+
+
+    public function ajax_create_product() {
+    set_time_limit(900);
+    ini_set('memory_limit', '4096M');
+
+    $target = trim( sanitize_text_field( $_POST['sku'] ?? '' ) );
+    if ( empty($target) ) wp_send_json_error("SKU mancante.");
+
+    // 1) Scarica feed remoto in file temporaneo (zero JSON locale)
+    $url = 'https://www.pfconcept.com/portal/datafeed/productfeed_it_v3.json';
+    $data = $this->fetch_json_stream( $url );
+    if ( is_string($data) ) {
+        wp_send_json_error("Errore download/JSON: " . $data);
+    }
+
+    // 2) Trova lista modelli: pfcProductfeed -> productfeed -> models
+    $models_list = [];
+    if ( isset($data['pfcProductfeed']['productfeed']['models']) && is_array($data['pfcProductfeed']['productfeed']['models']) ) {
+        $models_list = $data['pfcProductfeed']['productfeed']['models'];
+    }
+
+    if ( empty($models_list) ) {
+        // debug utile: quali chiavi ci sono a livello root
+        $root_keys = is_array($data) ? implode(', ', array_keys($data)) : 'N/A';
+        wp_send_json_error("Struttura JSON non riconosciuta o models vuoto. Root keys: {$root_keys}");
+    }
+
+    // 3) Normalizza: ogni entry è { model: {...} } (come nel tuo esempio)
+    $models_clean = [];
+    foreach ( $models_list as $wrap ) {
+        if ( isset($wrap['model']) && is_array($wrap['model']) ) {
+            $models_clean[] = $wrap['model'];
+        } elseif ( is_array($wrap) ) {
+            // fallback (nel caso arrivi già il model “nudo”)
+            $models_clean[] = $wrap;
+        }
+    }
+
+    if ( empty($models_clean) ) {
+        wp_send_json_error("models presenti ma non convertibili in array di model.");
+    }
+
+    // 4) Cerca per modelCode
+    $found_model = null;
+    foreach ( $models_clean as $model ) {
+        $modelCode = $model['modelCode'] ?? '';
+        if ( $modelCode && strcasecmp(trim((string)$modelCode), $target) === 0 ) {
+            $found_model = $model;
+            break;
+        }
+    }
+
+    // 5) Se non trovato: cerca per itemCode dentro items
+    if ( ! $found_model ) {
+        foreach ( $models_clean as $model ) {
+            $items = $this->normalize_items( $model ); // la tua funzione wrapper-aware
+            if ( empty($items) ) continue;
+
+            foreach ( $items as $it ) {
+                $itemCode = $it['itemCode'] ?? $it['itemcode'] ?? '';
+                if ( $itemCode && strcasecmp(trim((string)$itemCode), $target) === 0 ) {
+                    $found_model = $model;
+                    break 2;
                 }
             }
         }
-
-        if ( ! $found_model ) wp_send_json_error( "Modello <b>$target_sku</b> non trovato." );
-
-        // 4. Creazione
-        $product_id = $this->create_variable_product( $found_model );
-
-        if ( is_wp_error( $product_id ) ) wp_send_json_error( $product_id->get_error_message() );
-
-        unset($data); unset($json_content);
-
-        wp_send_json_success( "Prodotto Creato! <a href='".get_edit_post_link($product_id)."' target='_blank'>Modifica</a> | <a href='".get_permalink($product_id)."' target='_blank'>Vedi</a>" );
     }
+
+    if ( ! $found_model ) {
+        wp_send_json_error("Modello/SKU <b>{$target}</b> non trovato nel productfeed (né modelCode né itemCode).");
+    }
+
+    // 6) Creazione prodotto (tuo metodo)
+    $product_id = $this->create_variable_product( $found_model );
+    if ( is_wp_error( $product_id ) ) wp_send_json_error( $product_id->get_error_message() );
+
+    // libera memoria
+    unset($data);
+
+    wp_send_json_success(
+        "Prodotto Creato! <a href='".get_edit_post_link($product_id)."' target='_blank'>Modifica</a> | <a href='".get_permalink($product_id)."' target='_blank'>Vedi</a>"
+    );
+}
+
+
 
     private function normalize_items( $model_data ) {
-        $raw_items_container = $model_data['items'] ?? [];
-        if ( empty( $raw_items_container ) ) return [];
+    $raw = $model_data['items'] ?? [];
+    if ( empty($raw) ) return [];
 
-        $clean_items = [];
-        foreach ( $raw_items_container as $wrapper ) {
-            $item_data = (isset($wrapper['item']) && is_array($wrapper['item'])) ? $wrapper['item'] : $wrapper;
-            if ( ! empty( $item_data['itemCode'] ) ) {
-                $clean_items[] = $item_data;
+    $out = [];
+
+    // Caso A: items è array di wrapper: [ {item:{...}}, {item:{...}} ]
+    if ( is_array($raw) ) {
+        foreach ( $raw as $w ) {
+            if ( isset($w['item']) && is_array($w['item']) ) {
+                $it = $w['item'];
+            } else {
+                $it = $w;
             }
+
+            $code = $it['itemCode'] ?? $it['itemcode'] ?? '';
+            if ( ! empty($code) ) $out[] = $it;
         }
-        return $clean_items;
     }
+
+    return $out;
+}
+
 
     // --- HELPER DI ESTRAZIONE ---
     private function get_color_data( $item ) {

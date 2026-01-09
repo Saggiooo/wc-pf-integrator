@@ -120,7 +120,6 @@ class PF_Settings_Page {
                 
                 <div style="background:#fff; border:1px solid #ccc; padding:20px; max-width:800px;">
                     <h3>⚡ Aggiornamento Manuale Prezzi e Giacenze</h3>
-                    <p>Usa questo pulsante <strong>Sabato dopo le 14:00</strong> (o quando vuoi forzare un aggiornamento).</p>
                     <p>Questo comando scaricherà i feed Prezzi, Stock e Stampa e aggiornerà i prodotti esistenti.</p>
                     
                     <button id="pf-run-manual-import" class="button button-secondary button-large">Esegui Aggiornamento Listini Ora</button>

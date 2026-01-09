@@ -43,6 +43,7 @@ require_once PF_PLUGIN_PATH . 'includes/class-pf-gateway.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-frontend.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-webhook.php';
 require_once PF_PLUGIN_PATH . 'includes/class-pf-product-creator.php';
+require_once PF_PLUGIN_PATH . 'includes/class-pf-ajax.php';
 
 // 3. Inizializzazione Plugin
 function pf_init_plugin() {
@@ -52,10 +53,13 @@ function pf_init_plugin() {
     new PF_Frontend();
     new PF_Webhook();
     new PF_Product_Creator();
+    new PF_Ajax();
+
     // Settings si auto-inizializza se is_admin()
 }
 add_action( 'plugins_loaded', 'pf_init_plugin' );
 
+/*
 // 1. Caricamento Script Frontend
 add_action( 'wp_enqueue_scripts', 'pf_enqueue_frontend_scripts' );
 
@@ -69,71 +73,98 @@ function pf_enqueue_frontend_scripts() {
         'ajax_url' => admin_url( 'admin-ajax.php' ),
         'nonce'    => wp_create_nonce( 'pf_calc_nonce' )
     ]);
-}
+} */
 
 // 2. Gestore Calcolo AJAX
-add_action( 'wp_ajax_pf_calculate_price_ajax', 'pf_handle_ajax_calculation' );
-add_action( 'wp_ajax_nopriv_pf_calculate_price_ajax', 'pf_handle_ajax_calculation' );
+// NOTA: Mantieni 'pf_calculate_price_ajax' come nome dell'azione se il tuo JS chiama quella action.
+add_action( 'wp_ajax_pf_calculate_price_ajax', 'pf_calculate_price_ajax' ); 
+add_action( 'wp_ajax_nopriv_pf_calculate_price_ajax', 'pf_calculate_price_ajax' );
 
-function pf_handle_ajax_calculation() {
+function pf_calculate_price_ajax() { // Ho rinominato la funzione per coerenza con il tuo codice desiderato
     check_ajax_referer( 'pf_calc_nonce', 'security' );
 
-    $product_id = intval( $_POST['product_id'] );
-    $qty = intval( $_POST['quantity'] );
-    $print_code = sanitize_text_field( $_POST['print_code'] );
-    $colors = intval( $_POST['print_colors'] );
+    $qty = isset($_POST['quantity']) ? absint($_POST['quantity']) : 0;
+    $code = isset($_POST['print_code']) ? sanitize_text_field($_POST['print_code']) : '';
+    $colors = isset($_POST['print_colors']) ? absint($_POST['print_colors']) : 1;
 
-    $product = wc_get_product( $product_id );
-    if ( ! $product ) wp_send_json_error( 'Prodotto non trovato' );
+    // Se i dati sono invalidi, restituisci 0
+    if ( $qty <= 0 || empty($code) ) {
+        wp_send_json_success([ 'print_total' => 0, 'setup_total' => 0 ]);
+    }
 
-    // A. Prezzo Base (con ricarico già applicato nell'import)
-    $base_price = (float) $product->get_price();
-    $total_unit_price = $base_price;
-    $breakdown = [];
+    global $wpdb;
+    $table = $wpdb->prefix . 'pf_print_prices';
 
-    // B. Calcolo Stampa (se selezionata)
-    if ( ! empty( $print_code ) && $colors > 0 ) {
-        // Usiamo la logica della classe Pricing (istanziamola al volo o rendiamo il metodo statico)
-        // Per semplicità, replico la query qui o chiamo un metodo helper
-        global $wpdb;
-        $table = $wpdb->prefix . 'pf_print_prices';
-        
-        $row = $wpdb->get_row( $wpdb->prepare( "
-            SELECT unit_price, setup_cost 
+    // 1. TENTATIVO ESATTO (Es. cerco 1 colore)
+    // Questa logica segue il manuale Print Price Feed che definisce setup e costi unitari [cite: 782, 803]
+    $sql = $wpdb->prepare(
+        "SELECT unit_price, setup_cost 
             FROM $table 
             WHERE print_code = %s 
             AND colors_count = %d 
             AND quantity_start <= %d 
             ORDER BY quantity_start DESC 
-            LIMIT 1
-        ", $print_code, $colors, $qty ) );
+            LIMIT 1",
+        $code, $colors, $qty
+    );
+    $row = $wpdb->get_row( $sql );
 
-        if ( $row ) {
-            $markup_print = (float) get_option( 'pf_print_markup', 1.00 );
-            
-            $print_unit_cost = (float) $row->unit_price;
-            $setup_cost_total = (float) $row->setup_cost;
-            
-            // Spalma il costo impianto sulla quantità
-            $setup_per_unit = $setup_cost_total / $qty;
-            
-            // Totale stampa per unità (con ricarico)
-            $print_total_unit = ($print_unit_cost + $setup_per_unit) * $markup_print;
-            
-            $total_unit_price += $print_total_unit;
-            
-            $breakdown[] = "Stampa: " . wc_price($print_total_unit * $qty);
-        }
+    // 2. FALLBACK A 4 COLORI (Es. Stampa Digitale spesso è Full Color)
+    if ( ! $row ) {
+        $sql = $wpdb->prepare(
+            "SELECT unit_price, setup_cost 
+                FROM $table 
+                WHERE print_code = %s 
+                AND colors_count = 4 
+                AND quantity_start <= %d 
+                ORDER BY quantity_start DESC 
+                LIMIT 1",
+            $code, $qty
+        );
+        $row = $wpdb->get_row( $sql );
     }
 
-    // C. Calcolo Totale
-    $total_price = $total_unit_price * $qty;
+    // 3. FALLBACK A 0 COLORI (Es. Incisione/Laser che non dipendono dai colori [cite: 791])
+    if ( ! $row ) {
+        $sql = $wpdb->prepare(
+            "SELECT unit_price, setup_cost 
+                FROM $table 
+                WHERE print_code = %s 
+                AND colors_count = 0 
+                AND quantity_start <= %d 
+                ORDER BY quantity_start DESC 
+                LIMIT 1",
+            $code, $qty
+        );
+        $row = $wpdb->get_row( $sql );
+    }
+
+    // Se ancora non trovo nulla, restituisco 0
+    if ( ! $row ) {
+        wp_send_json_success([ 'print_total' => 0, 'setup_total' => 0 ]);
+    }
+
+    // Calcoli con Markup
+    // Il manuale Gateway specifica che i prezzi nel feed sono netti[cite: 752], quindi il markup è necessario lato WP.
+    $markup = (float) get_option( 'pf_print_markup', 1.00 ); // Usa l'opzione che avevi nel codice originale o 'pf_global_markup'
     
-    // Risposta JSON
+    $net_print_unit = (float) $row->unit_price;
+    $net_setup_cost = (float) $row->setup_cost;
+
+    // Applica markup
+    $gross_print_unit = $net_print_unit * $markup;
+    $gross_setup_cost = $net_setup_cost * $markup;
+
+    // Totale stampa = (Costo unitario lordo * quantità)
+    $print_total = $gross_print_unit * $qty;
+    
+    // Totale setup = Costo impianto lordo (una tantum per ordine/grafica)
+    $setup_total = $gross_setup_cost;
+
+    // Restituisco JSON con numeri puri per il JS
     wp_send_json_success([
-        'html' => wc_price( $total_price ), // Prezzo formattato WooCommerce
-        'unit_html' => wc_price( $total_unit_price ),
-        'breakdown_html' => implode('<br>', $breakdown)
+        'print_total' => number_format($print_total, 2, '.', ''), 
+        'setup_total' => number_format($setup_total, 2, '.', '')
     ]);
 }
 
@@ -207,6 +238,7 @@ function pf_inject_test_data() {
     wp_die( "✅ DATI TEST INSERITI!<br>Prodotto ID: $product_id ($sku_da_cercare)<br>- Prezzi a scalare inseriti<br>- Opzioni Stampa (Serigrafia/Laser) inserite<br>- Costi stampa inseriti nel DB.<br><br><b>Ora vai sulla pagina prodotto e ricarica (F5).</b>" );
 }
 
+/*
 // Gestore AJAX Bulk Add to Cart
 add_action( 'wp_ajax_pf_bulk_add_to_cart', 'pf_handle_bulk_add_cart' );
 add_action( 'wp_ajax_nopriv_pf_bulk_add_to_cart', 'pf_handle_bulk_add_cart' );
@@ -244,7 +276,7 @@ function pf_handle_bulk_add_cart() {
         } else {
             wp_send_json_error( 'Errore caricamento file: ' . $movefile['error'] );
         }
-    }
+    } 
 
     // AGGIUNTA AL CARRELLO
     foreach ( $items as $item ) {
@@ -272,3 +304,90 @@ function pf_handle_bulk_add_cart() {
 
     wp_send_json_success();
 }
+*/
+
+/**
+ * 1. MODIFICA PREZZO PRODOTTO (Merce + Costo Stampa Unitario)
+ * Questo hook intercetta il carrello prima del calcolo dei totali
+ */
+add_action( 'woocommerce_before_calculate_totals', 'pf_apply_custom_price', 10, 1 );
+
+function pf_apply_custom_price( $cart ) {
+    if ( is_admin() && ! defined( 'DOING_AJAX' ) ) return;
+
+    foreach ( $cart->get_cart() as $cart_item ) {
+        // Verifichiamo se l'articolo ha i dati di personalizzazione PF
+        if ( isset( $cart_item['pf_customization'] ) ) {
+            
+            // Recuperiamo il costo stampa UNITARIO salvato da PF_Ajax
+            // Nota: in PF_Ajax l'abbiamo salvato come 'print_unit_cost'
+            $print_unit_cost = isset($cart_item['pf_customization']['print_unit_cost']) 
+                ? (float) $cart_item['pf_customization']['print_unit_cost'] 
+                : 0;
+
+            if ( $print_unit_cost > 0 ) {
+                $product = $cart_item['data'];
+                
+                // Prezzo Base originale del prodotto
+                $base_price = (float) $product->get_price();
+                
+                // Nuovo Prezzo = Base + Stampa
+                $new_price = $base_price + $print_unit_cost;
+                
+                // Impostiamo il nuovo prezzo per questo calcolo
+                $product->set_price( $new_price );
+            }
+        }
+    }
+}
+
+/**
+ * 2. AGGIUNGI COSTO IMPIANTO (Fee Globale)
+ * Questo hook aggiunge una riga extra nel totale carrello per l'impianto
+ */
+add_action( 'woocommerce_cart_calculate_fees', 'pf_add_setup_fees', 20, 1 );
+
+function pf_add_setup_fees( $cart ) {
+    if ( is_admin() && ! defined( 'DOING_AJAX' ) ) return;
+    if ( ! $cart || $cart->is_empty() ) return;
+
+    $batches_processed = [];
+
+    foreach ( $cart->get_cart() as $cart_item ) {
+        if ( empty($cart_item['pf_customization']) ) continue;
+
+        $data = $cart_item['pf_customization'];
+        $batch_id   = isset($data['batch_id']) ? (string) $data['batch_id'] : '';
+        $setup_cost = isset($data['setup_cost_total']) ? (float) $data['setup_cost_total'] : 0;
+
+        if ( $setup_cost <= 0 || $batch_id === '' ) continue;
+        if ( isset($batches_processed[$batch_id]) ) continue;
+
+        $cart->add_fee( 'Costo Impianto Stampa', $setup_cost, true );
+        $batches_processed[$batch_id] = true;
+    }
+}
+
+
+/**
+ * 3. MOSTRA DETTAGLI NEL CARRELLO (Opzionale ma utile per debug)
+ * Mostra "Codice Stampa: GPE02" sotto il nome del prodotto
+ **/
+/*
+add_filter( 'woocommerce_get_item_data', 'pf_display_cart_meta', 10, 2 );
+
+function pf_display_cart_meta( $item_data, $cart_item ) {
+    if ( isset( $cart_item['pf_customization'] ) ) {
+        $data = $cart_item['pf_customization'];
+        
+        if ( ! empty($data['print_code']) ) {
+            $item_data[] = [
+                'key'     => 'Stampa',
+                'value'   => $data['print_code'] . ' (' . $data['colors'] . ' colori)',
+            ];
+        }
+    }
+    return $item_data;
+}
+    */
+    

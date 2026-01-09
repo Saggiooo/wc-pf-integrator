@@ -4,6 +4,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 class PF_Gateway {
 
     public function __construct() {
+        add_action( 'woocommerce_order_status_processing', [ $this, 'schedule_order_sending' ], 10, 1 );
         add_action( 'woocommerce_payment_complete', [ $this, 'schedule_order_sending' ] );
         add_action( 'pf_async_send_order_event', [ $this, 'send_order_to_pf_now' ], 10, 1 );
     }
@@ -41,10 +42,11 @@ class PF_Gateway {
             "receiverId"=> "PF"
         ];
 
+        $shipment_ref_id = "0";
         // Spedizione (Semplificata)
         $shipping = $order->get_address( 'shipping' ) ?: $order->get_address( 'billing' );
         $shipments = [[
-            "shipmentReferenceID" => 1,
+            "shipmentReferenceID" => $shipment_ref_id,
             "Service" => "STD",
             "shipContact" => [
                 "Name" => $shipping['first_name'] . ' ' . $shipping['last_name'],
@@ -69,20 +71,32 @@ class PF_Gateway {
         $art_ref_id_counter = 0;
 
         $order_type = "BLANK"; 
+        $sku_ref_counter = 0;
+
 
         foreach ( $order->get_items() as $item_id => $item ) {
+
+            $sku_ref_id = (string) $sku_ref_counter++;
+
             $product = $item->get_product();
             $sku_pf = $product->get_sku();
+            if ( empty($sku_pf) ) {
+                $order->add_order_note("❌ PF: SKUID (SKU Woo) vuoto per item {$item_id}");
+                $order->update_status('on-hold');
+                return;
+}
+
             $unit_price = (float) $product->get_meta('_pf_net_price') ?: 0.01;
 
             // Prepariamo l'oggetto SKU base
             $sku_data = [
-                "skuReferenceID" => $item_id,
-                "isItemProof" => false,
-                "SKUID" => $sku_pf,
-                "Quantity" => $item->get_quantity(),
-                "UnitPrice" => $unit_price 
+                "skuReferenceID" => $sku_ref_id,
+                "isItemProof"    => false,
+                "SKUID"          => $sku_pf,
+                "Quantity"       => (int) $item->get_quantity(),
+                "UnitPrice"      => (float) $unit_price
             ];
+
 
             // Recuperiamo i dati di personalizzazione salvati nel carrello
             // (Assumiamo che il frontend salvi: pf_customization[print_code], pf_customization[colors], pf_customization[logo_url])
@@ -93,13 +107,16 @@ class PF_Gateway {
                 $order_type = "DECORATED";
                 
                 // Generiamo ID univoci per collegare SKU -> Decorazione -> Artwork
-                $current_deco_id = $deco_ref_id_counter++;
-                $current_art_id = $art_ref_id_counter++;
+                $current_deco_id = (string) $deco_ref_id_counter++;
+                $current_art_id  = (string) $art_ref_id_counter++;
 
-                // 1. Collega SKU alla Decorazione
                 $sku_data['DecorationReferenceIDs'] = [ $current_deco_id ];
 
-                if ( empty( $real_config_id ) ) $real_config_id = "1-front";
+
+                $real_config_id = ! empty($custom_data['config_id'])
+                ? $custom_data['config_id']
+                : '1-front';
+
 
                 // 2. Crea Oggetto Decorazione
                 $decorations_collected[] = [
@@ -155,6 +172,29 @@ class PF_Gateway {
             'body'    => json_encode( $body ),
             'timeout' => 45
         ]);
+
+            $http_code = wp_remote_retrieve_response_code( $response );
+            $raw_body  = wp_remote_retrieve_body( $response );
+
+            $order->add_order_note( "PF HTTP: {$http_code}. Body: {$raw_body}" );
+
+            $resp_body = json_decode( $raw_body, true );
+
+            // Accettato dal gateway = 202 (anche se “processing not completed”)
+            if ( $http_code == 202 && isset($resp_body['status']) && $resp_body['status'] === 'success' ) {
+                $order->add_order_note( "✅ PF Gateway ACCEPTED (TEST=" . (($env==='test')?'yes':'no') . ") messageId=" . ($header['messageId'] ?? '') );
+                $order->update_meta_data( '_pf_order_sent', 'yes' );
+                $order->update_meta_data( '_pf_gateway_http', (string)$http_code );
+                $order->update_meta_data( '_pf_gateway_messageId', $header['messageId'] ?? '' );
+                $order->save();
+            } else {
+                $order->add_order_note( "❌ PF NOT accepted. HTTP {$http_code}. Msg: " . ($resp_body['message'] ?? 'n/a') );
+                $order->update_meta_data( '_pf_gateway_http', (string)$http_code );
+                $order->update_meta_data( '_pf_gateway_messageId', $header['messageId'] ?? '' );
+                $order->save();
+            }
+
+
 
         // Gestione Risposta (Logica uguale a prima...)
         if ( is_wp_error( $response ) ) {
